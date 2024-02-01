@@ -1,6 +1,8 @@
 use anyhow::Context;
 use cargo_metadata::Package;
 use crates_index::{Crate, GitIndex, SparseIndex};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use std::{
@@ -11,9 +13,39 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RegistryConfig {
+    pub dl: String,
+    pub api: String,
+    #[serde(rename = "auth-required")]
+    pub auth_required: Option<bool>,
+}
+pub struct SparseIndexData {
+    data: SparseIndex,
+    config: RegistryConfig,
+}
+
+impl SparseIndexData {
+    pub async fn from_index(
+        data: SparseIndex,
+        token: &Option<SecretString>,
+    ) -> anyhow::Result<SparseIndexData> {
+        let config = get_registry_config(&data, token).await?;
+        Ok(SparseIndexData { data, config })
+    }
+
+    pub fn data(&self) -> &SparseIndex {
+        &self.data
+    }
+
+    pub fn config(&self) -> &RegistryConfig {
+        &self.config
+    }
+}
+
 pub enum CargoIndex {
     Git(GitIndex),
-    Sparse(SparseIndex),
+    Sparse(SparseIndexData),
 }
 
 fn cargo_cmd() -> Command {
@@ -66,15 +98,48 @@ pub struct CmdOutput {
     pub stderr: String,
 }
 
+pub async fn get_registry_config(
+    index: &SparseIndex,
+    token: &Option<SecretString>,
+) -> anyhow::Result<RegistryConfig> {
+    let url = reqwest::Url::parse(index.url())?
+        .join("config.json")?
+        .to_string();
+    let client = reqwest::ClientBuilder::new()
+        .gzip(true)
+        .http2_prior_knowledge()
+        .build()?;
+    let req = client.get(&url).build()?;
+    let resp = client.execute(req).await?;
+    let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if let Some(t) = token {
+            let req = client
+                .get(&url)
+                .header("Authorization", t.expose_secret())
+                .build()?;
+            client.execute(req).await?
+        } else {
+            resp
+        }
+    } else {
+        resp
+    };
+    let body = resp.bytes().await?;
+    let config: RegistryConfig = serde_json::from_slice(&body)?;
+
+    Ok(config)
+}
+
 pub async fn is_published(
     index: &mut CargoIndex,
     package: &Package,
     timeout: Duration,
+    token: &Option<SecretString>,
 ) -> anyhow::Result<bool> {
     tokio::time::timeout(timeout, async {
         match index {
             CargoIndex::Git(index) => is_published_git(index, package),
-            CargoIndex::Sparse(index) => is_in_cache_sparse(index, package).await,
+            CargoIndex::Sparse(index) => is_in_cache_sparse(index, package, token).await,
         }
     })
     .await?
@@ -100,8 +165,12 @@ fn is_in_cache_git(index: &GitIndex, package: &Package) -> bool {
     is_in_cache(crate_data.as_ref(), version)
 }
 
-async fn is_in_cache_sparse(index: &SparseIndex, package: &Package) -> anyhow::Result<bool> {
-    let crate_data = fetch_sparse_metadata(index, &package.name)
+async fn is_in_cache_sparse(
+    index: &SparseIndexData,
+    package: &Package,
+    token: &Option<SecretString>,
+) -> anyhow::Result<bool> {
+    let crate_data = fetch_sparse_metadata(index, &package.name, token)
         .await
         .context("failed fetching sparse metadata")?;
     let version = &package.version.to_string();
@@ -122,14 +191,23 @@ fn is_version_present(version: &str, crate_data: &Crate) -> bool {
 }
 
 async fn fetch_sparse_metadata(
-    index: &SparseIndex,
+    index: &SparseIndexData,
     crate_name: &str,
+    token: &Option<SecretString>,
 ) -> anyhow::Result<Option<Crate>> {
-    let req = index.make_cache_request(crate_name)?;
+    let req = index.data().make_cache_request(crate_name)?;
     let (parts, _) = req.body(())?.into_parts();
     let req = http::Request::from_parts(parts, vec![]);
 
-    let req: reqwest::Request = req.try_into()?;
+    let mut req: reqwest::Request = req.try_into()?;
+
+    if index.config().auth_required.unwrap_or(false) {
+        if let Some(t) = token {
+            if let Ok(h) = http::HeaderValue::from_str(t.expose_secret().as_str()) {
+                req.headers_mut().append("Authorization", h);
+            }
+        }
+    }
 
     let client = reqwest::ClientBuilder::new()
         .gzip(true)
@@ -148,7 +226,7 @@ async fn fetch_sparse_metadata(
     let body = res.bytes().await?;
     let res = builder.body(body.to_vec())?;
 
-    let crate_data = index.parse_cache_response(crate_name, res, true)?;
+    let crate_data = index.data().parse_cache_response(crate_name, res, true)?;
 
     Ok(crate_data)
 }
@@ -157,13 +235,14 @@ pub async fn wait_until_published(
     index: &mut CargoIndex,
     package: &Package,
     timeout: Duration,
+    token: &Option<SecretString>,
 ) -> anyhow::Result<()> {
     let now: Instant = Instant::now();
     let sleep_time = Duration::from_secs(2);
     let mut logged = false;
 
     loop {
-        let is_published = is_published(index, package, timeout).await?;
+        let is_published = is_published(index, package, timeout, token).await?;
         if is_published {
             break;
         } else if timeout < now.elapsed() {

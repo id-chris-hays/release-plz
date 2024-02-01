@@ -14,7 +14,9 @@ use tracing::{info, instrument, warn};
 use url::Url;
 
 use crate::{
-    cargo::{is_published, run_cargo, wait_until_published, CargoIndex, CmdOutput},
+    cargo::{
+        is_published, run_cargo, wait_until_published, CargoIndex, CmdOutput, SparseIndexData,
+    },
     changelog_parser,
     git::backend::GitClient,
     release_order::release_order,
@@ -396,17 +398,25 @@ pub async fn release(input: &ReleaseRequest) -> anyhow::Result<()> {
             );
             continue;
         }
-        let registry_indexes = registry_indexes(package, input.registry.clone())
+        // Fetch a token for the registry from the host if one wasn't provided
+        let token = if input.token.is_none() {
+            cargo_utils::registry_token(&input.registry)?
+        } else {
+            input.token.clone()
+        };
+        let registry_indexes = registry_indexes(package, &input.registry, &token)
+            .await
             .context("can't determine registry indexes")?;
+
         for mut index in registry_indexes {
-            if is_published(&mut index, package, input.publish_timeout)
+            if is_published(&mut index, package, input.publish_timeout, &token)
                 .await
                 .context("can't determine if package is published")?
             {
                 info!("{} {}: already published", package.name, package.version);
                 continue;
             }
-            release_package(&mut index, package, input, git_tag.clone())
+            release_package(&mut index, package, input, git_tag.clone(), &token)
                 .await
                 .context("failed to release package")?;
         }
@@ -417,11 +427,13 @@ pub async fn release(input: &ReleaseRequest) -> anyhow::Result<()> {
 /// Get the indexes where the package should be published.
 /// If `registry` is specified, it takes precedence over the `publish` field
 /// of the package manifest.
-fn registry_indexes(
+async fn registry_indexes(
     package: &Package,
-    registry: Option<String>,
+    registry: &Option<String>,
+    token: &Option<SecretString>,
 ) -> anyhow::Result<Vec<CargoIndex>> {
     let registries = registry
+        .clone()
         .map(|r| vec![r])
         .unwrap_or_else(|| package.publish.clone().unwrap_or_default());
     let registry_urls = registries
@@ -432,18 +444,19 @@ fn registry_indexes(
         })
         .collect::<anyhow::Result<Vec<Url>>>()?;
 
-    let mut registry_indexes = registry_urls
-        .iter()
-        .map(|u| {
-            if u.to_string().starts_with("sparse+") {
-                SparseIndex::from_url(u.as_str()).map(CargoIndex::Sparse)
-            } else {
-                GitIndex::from_url(&format!("registry+{u}")).map(CargoIndex::Git)
-            }
-        })
-        .collect::<Result<Vec<CargoIndex>, crates_index::Error>>()?;
+    let mut registry_indexes = Vec::new();
+    for u in registry_urls.iter() {
+        if u.to_string().starts_with("sparse+") {
+            let si = SparseIndexData::from_index(SparseIndex::from_url(u.as_str())?, token).await?;
+            registry_indexes.push(CargoIndex::Sparse(si))
+        } else {
+            registry_indexes.push(CargoIndex::Git(GitIndex::from_url(&format!(
+                "registry+{u}"
+            ))?))
+        }
+    }
     if registry_indexes.is_empty() {
-        registry_indexes.push(CargoIndex::Git(GitIndex::new_cargo_default()?))
+        registry_indexes.push(CargoIndex::Git(GitIndex::new_cargo_default()?));
     }
     Ok(registry_indexes)
 }
@@ -453,6 +466,7 @@ async fn release_package(
     package: &Package,
     input: &ReleaseRequest,
     git_tag: String,
+    token: &Option<SecretString>,
 ) -> anyhow::Result<()> {
     let workspace_root = &input.metadata.workspace_root;
 
@@ -460,7 +474,7 @@ async fn release_package(
 
     let publish = input.is_publish_enabled(&package.name);
     if publish {
-        let output = run_cargo_publish(package, input, workspace_root.as_std_path())
+        let output = run_cargo_publish(package, input, workspace_root.as_std_path(), token)
             .context("failed to run cargo publish")?;
         if !output.status.success()
             || !output.stderr.contains("Uploading")
@@ -477,7 +491,7 @@ async fn release_package(
         );
     } else {
         if publish {
-            wait_until_published(index, package, input.publish_timeout).await?;
+            wait_until_published(index, package, input.publish_timeout, token).await?;
         }
 
         if input.is_git_tag_enabled(&package.name) {
@@ -519,6 +533,7 @@ fn run_cargo_publish(
     package: &Package,
     input: &ReleaseRequest,
     workspace_root: &Path,
+    token: &Option<SecretString>,
 ) -> anyhow::Result<CmdOutput> {
     let mut args = vec!["publish"];
     args.push("--color");
@@ -529,7 +544,7 @@ fn run_cargo_publish(
         args.push("--registry");
         args.push(registry);
     }
-    if let Some(token) = &input.token {
+    if let Some(token) = &token {
         args.push("--token");
         args.push(token.expose_secret());
     }

@@ -1,4 +1,5 @@
 use anyhow::Context;
+use secrecy::SecretString;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -123,4 +124,60 @@ fn cargo_home() -> anyhow::Result<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or(default_cargo_home);
     Ok(cargo_home)
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryCredential {
+    token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoCredentials {
+    #[serde(default)]
+    registries: HashMap<String, RegistryCredential>,
+}
+
+/// Find the token for use with a registry
+pub fn registry_token(registry: &Option<String>) -> anyhow::Result<Option<SecretString>> {
+    let Some(registry_name) = registry else {
+        return Ok(None);
+    };
+
+    if registry_name == CRATES_IO_REGISTRY {
+        return Ok(None);
+    }
+
+    let environment_name = registry_name.replace('-', "_").to_uppercase();
+    if let Ok(t) = std::env::var(format!("CARGO_REGISTRIES_{}_TOKEN", environment_name)) {
+        return Ok(Some(SecretString::new(t)));
+    }
+
+    fn read_config(
+        registries: &mut HashMap<String, Option<SecretString>>,
+        path: impl AsRef<Path>,
+    ) -> anyhow::Result<()> {
+        let content = std::fs::read_to_string(path)?;
+        let config = toml::from_str::<CargoCredentials>(&content)
+            .context("Invalid cargo credentials config")?;
+        for (key, value) in config.registries {
+            registries
+                .entry(key)
+                .or_insert(value.token.map(SecretString::new));
+        }
+        Ok(())
+    }
+
+    let mut registries: HashMap<String, Option<SecretString>> = HashMap::new();
+    let default_cargo_home = cargo_home()?;
+    let default_config_path = default_cargo_home.join("credentials");
+    if default_config_path.is_file() {
+        read_config(&mut registries, default_config_path)?;
+    } else {
+        let default_config_path = default_cargo_home.join("credentials.toml");
+        if default_config_path.is_file() {
+            read_config(&mut registries, default_config_path)?;
+        }
+    }
+
+    Ok(registries.remove(registry_name).flatten())
 }
