@@ -1,6 +1,7 @@
 use anyhow::Context;
 use cargo_metadata::Package;
 use crates_index::{Crate, GitIndex, SparseIndex};
+use http::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -225,6 +226,10 @@ async fn fetch_sparse_metadata(
 
     let body = res.bytes().await?;
     let res = builder.body(body.to_vec())?;
+
+    if res.status() == StatusCode::OK && res.body().len() == 0 {
+        return Ok(None);
+    }
 
     let crate_data = index.data().parse_cache_response(crate_name, res, true)?;
 
